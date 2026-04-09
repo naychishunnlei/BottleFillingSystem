@@ -1,116 +1,93 @@
 /*
  * Bottle Filling System — CONTROLLER ESP32
+ * Scenario A: Automated Bottle Filling System
  *
- * Responsibilities:
- *   - Reads all sensors and switches
- *   - Runs filling state machine
- *   - Drives all actuators (valve, LEDs, buzzer)
- *   - Sends state to Receiver ESP32 via CAN bus every 200 ms
- *   - No WiFi needed
+ * Converts ladder logic rungs to FreeRTOS tasks.
+ * Sends system state to Receiver ESP32 via CAN bus (TWAI) every 200 ms.
  *
- * WIRING — MCP2515 CAN module (VSPI)
- *   MCP2515 VCC  → 3.3V
- *   MCP2515 GND  → GND
- *   MCP2515 SCK  → GPIO 18
- *   MCP2515 SI   → GPIO 23  (MOSI)
- *   MCP2515 SO   → GPIO 19  (MISO)
- *   MCP2515 CS   → GPIO  5
- *   MCP2515 INT  → GPIO  4  (optional, not used here)
- *   CAN H / CAN L → matched wiring to Receiver module
- *
- * NOTE: GPIO 18, 19 are used by SPI (MCP2515).
- *       LED pins are shifted to avoid conflict — see below.
+ * WIRING — CAN Transceiver (SN65HVD230 or TJA1050)
+ *   ESP32 GPIO 21 → TX pin of transceiver
+ *   ESP32 GPIO 22 → RX pin of transceiver
+ *   Transceiver CANH / CANL → matched to Receiver transceiver
+ *   Terminate each end of CAN bus with 120Ω resistor across CANH–CANL
  *
  * PIN MAPPING
- *  Inputs
- *    GPIO 34  Sensor 1 — Bottle presence
- *    GPIO 35  Sensor 2 — Bottle positioned
- *    GPIO 25  Switch 1 — Start
- *    GPIO 26  Switch 2 — Stop
- *    GPIO 27  Switch 3 — Emergency stop / Reset
- *
- *  Outputs
- *    GPIO 32  Relay    — Filling valve
- *    GPIO 33  LED Green  — System running
- *    GPIO 16  LED Yellow — Filling in progress
- *    GPIO 17  LED Red    — Error / stopped
- *    GPIO 15  Buzzer     — Cycle complete
+ *   GPIO 34  Sensor 1 — Bottle presence
+ *   GPIO 35  Sensor 2 — Bottle positioned / fill level
+ *   GPIO 25  Switch 1 — Start
+ *   GPIO 26  Switch 2 — Stop
+ *   GPIO 27  Switch 3 — Emergency stop / Reset
+ *   GPIO 32  Relay    — Filling valve
+ *   GPIO 19  LED Green  — System running
+ *   GPIO 18  LED Yellow — Filling in progress
+ *   GPIO  5  LED Red    — Error / stopped
+ *   GPIO 17  Buzzer     — Cycle complete
  *
  * CAN MESSAGES (500 kbps)
- *   ID 0x100 (2 bytes) — boolean flags
- *   ID 0x101 (8 bytes) — bottleCounter(2) + faultCount(2) + uptime(4)
- *
- * LIBRARY: mcp_can by Cory J. Fowler
- *   Arduino IDE → Library Manager → search "mcp_can" → install
+ *   ID 0x100  2 bytes — packed boolean flags
+ *   ID 0x101  8 bytes — bottleCounter(u16) + faultCount(u16) + uptime(u32)
  *
  * FreeRTOS Tasks
- *   taskInputs       (core 1, 10 ms)  — sensors & switch edges
- *   taskStateMachine (core 1, 10 ms)  — filling logic
- *   taskOutputs      (core 1, 10 ms)  — drives GPIO
- *   taskUptime       (core 1,  1 s)   — uptime counter
- *   taskCAN          (core 0, 200 ms) — sends CAN frames
- *   taskSerial       (core 0,  1 s)   — Serial Monitor dump
+ *   taskInputs       core 1, 10 ms  — reads sensors & detects switch edges
+ *   taskStateMachine core 1, 10 ms  — ladder logic state machine
+ *   taskOutputs      core 1, 10 ms  — drives GPIO outputs
+ *   taskUptime       core 1,  1 s   — increments uptime while running
+ *   taskCAN          core 0, 200 ms — transmits CAN frames
+ *   taskSerial       core 0,  1 s   — Serial Monitor state dump
  */
 
-#include <SPI.h>
-#include <mcp_can.h>
+#include "driver/twai.h"
 
-// ─── CAN ──────────────────────────────────────────────────────────────────────
-#define CAN_CS_PIN   5
-#define CAN_SPEED    CAN_500KBPS
-#define CAN_CLOCK    MCP_8MHZ        // change to MCP_16MHZ if your module has 16 MHz crystal
-
-MCP_CAN CAN_BUS(CAN_CS_PIN);
-
-// CAN message IDs
+// ─── CAN config ───────────────────────────────────────────────────────────────
+#define CAN_TX_PIN  21
+#define CAN_RX_PIN  22
 #define CAN_ID_FLAGS    0x100
 #define CAN_ID_COUNTERS 0x101
 
-// ─── Timing ───────────────────────────────────────────────────────────────────
-const TickType_t FILL_TICKS   = pdMS_TO_TICKS(5000);
-const TickType_t BUZZER_TICKS = pdMS_TO_TICKS(500);
-const TickType_t FAULT_TICKS  = pdMS_TO_TICKS(15000);
-const TickType_t CAN_TICKS    = pdMS_TO_TICKS(200);
+// ─── Timing (ladder TON timer values) ────────────────────────────────────────
+const TickType_t TON_FILL   = pdMS_TO_TICKS(5000);   // fill duration timer
+const TickType_t TON_BUZZER = pdMS_TO_TICKS(500);     // buzzer pulse timer
+const TickType_t TON_FAULT  = pdMS_TO_TICKS(15000);   // fault detection timeout
 
 // ─── Pins ─────────────────────────────────────────────────────────────────────
-const int PIN_SENSOR_PRESENCE = 34;
-const int PIN_SENSOR_LEVEL    = 35;
-const int PIN_SW_START        = 25;
-const int PIN_SW_STOP         = 26;
-const int PIN_SW_EMERGENCY    = 27;
+const int PIN_SENSOR1    = 34;  // I0.0 — bottle presence
+const int PIN_SENSOR2    = 35;  // I0.1 — bottle positioned
+const int PIN_SW_START   = 25;  // I0.2 — start
+const int PIN_SW_STOP    = 26;  // I0.3 — stop
+const int PIN_SW_EMERG   = 27;  // I0.4 — emergency stop / reset
 
-const int PIN_RELAY_VALVE     = 32;
-const int PIN_LED_GREEN       = 33;  // shifted — 19 used by VSPI MISO
-const int PIN_LED_YELLOW      = 16;  // shifted — 18 used by VSPI SCK
-const int PIN_LED_RED         = 17;
-const int PIN_BUZZER          = 15;
+const int PIN_VALVE      = 32;  // Q0.0 — filling valve relay
+const int PIN_LED_GREEN  = 19;  // Q0.1 — system running
+const int PIN_LED_YELLOW = 18;  // Q0.2 — filling in progress
+const int PIN_LED_RED    = 5;   // Q0.3 — fault / stopped
+const int PIN_BUZZER     = 17;  // Q0.4 — cycle complete alert
 
 // ─── Shared state ─────────────────────────────────────────────────────────────
 struct SystemState {
-  // Sensors / switches (written by taskInputs)
-  bool bottlePresent    = false;
-  bool bottlePositioned = false;
-  bool swStart          = false;
-  bool swStop           = false;
-  bool swEmergency      = false;
+  // Physical inputs
+  bool bottlePresent    = false;  // I0.0
+  bool bottlePositioned = false;  // I0.1
+  bool swStart          = false;  // I0.2 edge flag
+  bool swStop           = false;  // I0.3 edge flag
+  bool swEmergency      = false;  // I0.4 edge flag
 
-  // Logic (written by taskStateMachine)
-  bool systemRunning    = false;
-  bool fault            = false;
-  bool emergencyStop    = false;
-  bool fillEnable       = false;
-  bool fillingComplete  = false;
-  bool runLatch         = false;
-  bool conveyorMotor    = false;
-  bool valveOn          = false;
+  // Internal coils / bits (ladder memory bits)
+  bool systemRunning    = false;  // M0.0
+  bool fault            = false;  // M0.1
+  bool emergencyStop    = false;  // M0.2
+  bool fillEnable       = false;  // M0.3
+  bool fillingComplete  = false;  // M0.4
+  bool runLatch         = false;  // M0.5 — seal-in bit
+  bool conveyorMotor    = false;  // M0.6
 
-  // Outputs (written by taskOutputs)
-  bool greenLED         = false;
-  bool yellowLED        = false;
-  bool redLED           = true;
-  bool buzzerOn         = false;
+  // Outputs
+  bool valveOn          = false;  // Q0.0
+  bool greenLED         = false;  // Q0.1
+  bool yellowLED        = false;  // Q0.2
+  bool redLED           = true;   // Q0.3 — on at boot
+  bool buzzerOn         = false;  // Q0.4
 
-  // Counters
+  // Software counter (CTU)
   int  bottleCounter    = 0;
   int  faultCount       = 0;
   int  uptime           = 0;
@@ -119,11 +96,7 @@ struct SystemState {
 SystemState       g_state;
 SemaphoreHandle_t g_mutex;
 
-// ─── CAN flag byte packing ────────────────────────────────────────────────────
-//  Byte 0: [systemRunning | fault | emergencyStop | bottlePresent |
-//            bottlePositioned | fillEnable | fillingComplete | runLatch]
-//  Byte 1: [conveyorMotor | valveOn | greenLED | yellowLED |
-//            redLED | buzzerOn | 0 | 0]
+// ─── CAN flag packing ─────────────────────────────────────────────────────────
 uint8_t packFlags0(const SystemState& s) {
   return (s.systemRunning    << 7) | (s.fault            << 6) |
          (s.emergencyStop    << 5) | (s.bottlePresent    << 4) |
@@ -138,33 +111,29 @@ uint8_t packFlags1(const SystemState& s) {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // TASK: taskInputs  (core 1, 10 ms)
+// Reads physical inputs; detects rising edges on momentary switches.
 // ═════════════════════════════════════════════════════════════════════════════
 void taskInputs(void* pv) {
   bool lastStart = false, lastStop = false, lastEmerg = false;
-  Serial.println("[taskInputs] started");
 
   for (;;) {
-    bool rawPresent    = digitalRead(PIN_SENSOR_PRESENCE) == HIGH;
-    bool rawPositioned = digitalRead(PIN_SENSOR_LEVEL)    == HIGH;
-    bool rawStart      = digitalRead(PIN_SW_START)        == HIGH;
-    bool rawStop       = digitalRead(PIN_SW_STOP)         == HIGH;
-    bool rawEmerg      = digitalRead(PIN_SW_EMERGENCY)    == HIGH;
-
-    bool edgeStart = rawStart && !lastStart;
-    bool edgeStop  = rawStop  && !lastStop;
-    bool edgeEmerg = rawEmerg && !lastEmerg;
-
-    lastStart = rawStart;
-    lastStop  = rawStop;
-    lastEmerg = rawEmerg;
+    bool rawPresent    = digitalRead(PIN_SENSOR1)  == HIGH;
+    bool rawPositioned = digitalRead(PIN_SENSOR2)  == HIGH;
+    bool rawStart      = digitalRead(PIN_SW_START) == HIGH;
+    bool rawStop       = digitalRead(PIN_SW_STOP)  == HIGH;
+    bool rawEmerg      = digitalRead(PIN_SW_EMERG) == HIGH;
 
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     g_state.bottlePresent    = rawPresent;
     g_state.bottlePositioned = rawPositioned;
-    if (edgeStart) g_state.swStart     = true;
-    if (edgeStop)  g_state.swStop      = true;
-    if (edgeEmerg) g_state.swEmergency = true;
+    if (rawStart && !lastStart) g_state.swStart     = true;
+    if (rawStop  && !lastStop)  g_state.swStop      = true;
+    if (rawEmerg && !lastEmerg) g_state.swEmergency = true;
     xSemaphoreGive(g_mutex);
+
+    lastStart = rawStart;
+    lastStop  = rawStop;
+    lastEmerg = rawEmerg;
 
     vTaskDelay(pdMS_TO_TICKS(10));
   }
@@ -172,13 +141,13 @@ void taskInputs(void* pv) {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // TASK: taskStateMachine  (core 1, 10 ms)
+// Ladder-to-code conversion — each block below maps to a ladder rung.
 // ═════════════════════════════════════════════════════════════════════════════
 void taskStateMachine(void* pv) {
   TickType_t fillStart          = 0;
   TickType_t buzzerStart        = 0;
   TickType_t bottlePresentStart = 0;
   bool       buzzerPending      = false;
-  Serial.println("[taskStateMachine] started");
 
   for (;;) {
     TickType_t now = xTaskGetTickCount();
@@ -191,7 +160,9 @@ void taskStateMachine(void* pv) {
     bool present    = g_state.bottlePresent;
     bool positioned = g_state.bottlePositioned;
 
-    // Emergency stop / Reset
+    // ── Rung 1: Emergency stop override (highest priority) ───────────────────
+    // Ladder: [I0.4] ──┬── (M0.2) Emergency stop SET
+    //                  └── [/M0.2] ── (M0.2 RESET, M0.1 RESET)
     if (doEmerg) {
       if (!g_state.emergencyStop) {
         g_state.emergencyStop = true;
@@ -203,18 +174,20 @@ void taskStateMachine(void* pv) {
         g_state.buzzerOn      = false;
         g_state.faultCount++;
         buzzerPending = false;
-        Serial.println("[!!!] EMERGENCY STOP triggered!");
+        Serial.println("[!!!] EMERGENCY STOP");
       } else {
+        // Second press = reset
         g_state.emergencyStop   = false;
         g_state.fault           = false;
         g_state.fillingComplete = false;
         g_state.fillEnable      = false;
         bottlePresentStart      = 0;
-        Serial.println("[RST] System reset. Press START to run.");
+        Serial.println("[RST] Reset — press START to run");
       }
     }
 
-    // Stop
+    // ── Rung 2: Stop logic ────────────────────────────────────────────────────
+    // Ladder: [I0.3][M0.0] ── (M0.0 RESET, M0.5 RESET)
     if (doStop && g_state.systemRunning) {
       g_state.systemRunning = false;
       g_state.runLatch      = false;
@@ -222,55 +195,64 @@ void taskStateMachine(void* pv) {
       g_state.conveyorMotor = false;
       g_state.buzzerOn      = false;
       buzzerPending         = false;
-      Serial.println("[STP] Stop pressed — system halted.");
+      Serial.println("[STP] Stopped");
     }
 
-    // Start
+    // ── Rung 3: Start / seal-in latch ────────────────────────────────────────
+    // Ladder: [I0.2 + M0.5][/M0.2][/M0.1] ── (M0.0, M0.5)
     if (doStart && !g_state.systemRunning && !g_state.emergencyStop) {
       g_state.systemRunning = true;
       g_state.runLatch      = true;
       g_state.fault         = false;
       bottlePresentStart    = 0;
-      Serial.println("[RUN] Start pressed — system running.");
+      Serial.println("[RUN] Running");
     }
 
-    // Filling logic
+    // ── Rungs 4–7: Filling sequence (executes only when M0.0 = 1) ────────────
     if (g_state.systemRunning && !g_state.fault && !g_state.emergencyStop) {
       g_state.conveyorMotor = true;
 
+      // Rung 4: Open valve when bottle detected in position
+      // Ladder: [M0.0][I0.0][I0.1][/M0.3][/M0.4] ── (Q0.0, M0.3) TON start
       if (present && positioned && !g_state.fillEnable && !g_state.fillingComplete) {
         g_state.fillEnable = true;
         g_state.valveOn    = true;
         fillStart          = now;
         bottlePresentStart = 0;
-        Serial.printf("[FIL] Filling bottle #%d...\n", g_state.bottleCounter + 1);
+        Serial.printf("[FIL] Filling #%d\n", g_state.bottleCounter + 1);
       }
 
-      if (g_state.fillEnable && g_state.valveOn && (now - fillStart) >= FILL_TICKS) {
+      // Rung 5: TON done — close valve, increment CTU counter
+      // Ladder: [M0.3][TON >= 5s] ── (Q0.0 RESET, M0.4, CTU++)
+      if (g_state.fillEnable && g_state.valveOn && (now - fillStart) >= TON_FILL) {
         g_state.valveOn         = false;
         g_state.fillingComplete = true;
         g_state.fillEnable      = false;
-        g_state.bottleCounter++;
+        g_state.bottleCounter++;          // CTU count up
         g_state.buzzerOn        = true;
         buzzerPending           = true;
         buzzerStart             = now;
-        Serial.printf("[DON] Fill complete — total: %d bottles\n", g_state.bottleCounter);
+        Serial.printf("[DON] Bottle #%d done\n", g_state.bottleCounter);
       }
 
+      // Rung 6: Bottle removed — reset fill complete, ready for next cycle
+      // Ladder: [M0.4][/I0.0] ── (M0.4 RESET)
       if (g_state.fillingComplete && !present) {
         g_state.fillingComplete = false;
         bottlePresentStart      = 0;
-        Serial.println("[NXT] Bottle removed — ready for next.");
+        Serial.println("[NXT] Ready");
       }
 
+      // Rung 7: Fault — bottle present but not positioned within timeout
+      // Ladder: [I0.0][/I0.1][/M0.3][TON >= 15s] ── (M0.1, CTU_fault++)
       if (present && !positioned && !g_state.fillEnable && !g_state.fillingComplete) {
         if (bottlePresentStart == 0) bottlePresentStart = now;
-        if ((now - bottlePresentStart) >= FAULT_TICKS) {
+        if ((now - bottlePresentStart) >= TON_FAULT) {
           g_state.fault      = true;
           g_state.valveOn    = false;
           g_state.faultCount++;
           bottlePresentStart = 0;
-          Serial.println("[ERR] Fault: bottle not positioned in time.");
+          Serial.println("[ERR] Fault: bottle not positioned");
         }
       } else {
         if (!g_state.fillEnable && !present) bottlePresentStart = 0;
@@ -281,8 +263,9 @@ void taskStateMachine(void* pv) {
       if (!g_state.fillingComplete) g_state.valveOn = false;
     }
 
-    // Buzzer auto-off
-    if (buzzerPending && g_state.buzzerOn && (now - buzzerStart) >= BUZZER_TICKS) {
+    // ── Rung 8: Buzzer TOF timer ──────────────────────────────────────────────
+    // Ladder: [Q0.4][TON_buzzer >= 500ms] ── (Q0.4 RESET)
+    if (buzzerPending && g_state.buzzerOn && (now - buzzerStart) >= TON_BUZZER) {
       g_state.buzzerOn = false;
       buzzerPending    = false;
     }
@@ -294,10 +277,9 @@ void taskStateMachine(void* pv) {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // TASK: taskOutputs  (core 1, 10 ms)
+// Derives LED states from logic bits and drives all GPIO outputs.
 // ═════════════════════════════════════════════════════════════════════════════
 void taskOutputs(void* pv) {
-  Serial.println("[taskOutputs] started");
-
   for (;;) {
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     g_state.greenLED  =  g_state.systemRunning && !g_state.fault && !g_state.emergencyStop;
@@ -311,11 +293,11 @@ void taskOutputs(void* pv) {
     bool buzz   = g_state.buzzerOn;
     xSemaphoreGive(g_mutex);
 
-    digitalWrite(PIN_RELAY_VALVE,  valve  ? HIGH : LOW);
-    digitalWrite(PIN_LED_GREEN,    green  ? HIGH : LOW);
-    digitalWrite(PIN_LED_YELLOW,   yellow ? HIGH : LOW);
-    digitalWrite(PIN_LED_RED,      red    ? HIGH : LOW);
-    digitalWrite(PIN_BUZZER,       buzz   ? HIGH : LOW);
+    digitalWrite(PIN_VALVE,      valve  ? HIGH : LOW);
+    digitalWrite(PIN_LED_GREEN,  green  ? HIGH : LOW);
+    digitalWrite(PIN_LED_YELLOW, yellow ? HIGH : LOW);
+    digitalWrite(PIN_LED_RED,    red    ? HIGH : LOW);
+    digitalWrite(PIN_BUZZER,     buzz   ? HIGH : LOW);
 
     vTaskDelay(pdMS_TO_TICKS(10));
   }
@@ -323,9 +305,9 @@ void taskOutputs(void* pv) {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // TASK: taskUptime  (core 1, 1 s)
+// Software counter — increments only while system is running.
 // ═════════════════════════════════════════════════════════════════════════════
 void taskUptime(void* pv) {
-  Serial.println("[taskUptime] started");
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000));
     xSemaphoreTake(g_mutex, portMAX_DELAY);
@@ -336,44 +318,41 @@ void taskUptime(void* pv) {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // TASK: taskCAN  (core 0, 200 ms)
-// Sends two CAN frames:
+// Transmits two CAN frames to Receiver ESP32.
 //   0x100 — 2-byte packed boolean flags
-//   0x101 — 8-byte counters (bottleCounter, faultCount, uptime)
+//   0x101 — 8-byte counters
 // ═════════════════════════════════════════════════════════════════════════════
 void taskCAN(void* pv) {
-  Serial.println("[taskCAN] started");
-
   for (;;) {
-    vTaskDelay(CAN_TICKS);
+    vTaskDelay(pdMS_TO_TICKS(200));
 
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     SystemState s = g_state;
     xSemaphoreGive(g_mutex);
 
-    // Frame 0x100 — flags (2 bytes)
-    uint8_t flags[2] = { packFlags0(s), packFlags1(s) };
-    byte result = CAN_BUS.sendMsgBuf(CAN_ID_FLAGS, 0, 2, flags);
-    if (result != CAN_OK) {
-      Serial.printf("[CAN] Send 0x100 failed: %d\n", result);
-    }
+    // Frame 0x100 — flags
+    twai_message_t msg0 = {};
+    msg0.identifier       = CAN_ID_FLAGS;
+    msg0.data_length_code = 2;
+    msg0.data[0]          = packFlags0(s);
+    msg0.data[1]          = packFlags1(s);
+    esp_err_t r0 = twai_transmit(&msg0, pdMS_TO_TICKS(10));
+    if (r0 != ESP_OK) Serial.printf("[CAN] TX 0x100 err: %d\n", r0);
 
-    // Frame 0x101 — counters (8 bytes, big-endian)
-    uint8_t counters[8];
-    counters[0] = (s.bottleCounter >> 8) & 0xFF;
-    counters[1] =  s.bottleCounter       & 0xFF;
-    counters[2] = (s.faultCount    >> 8) & 0xFF;
-    counters[3] =  s.faultCount          & 0xFF;
-    counters[4] = (s.uptime >> 24) & 0xFF;
-    counters[5] = (s.uptime >> 16) & 0xFF;
-    counters[6] = (s.uptime >>  8) & 0xFF;
-    counters[7] =  s.uptime        & 0xFF;
-    result = CAN_BUS.sendMsgBuf(CAN_ID_COUNTERS, 0, 8, counters);
-    if (result != CAN_OK) {
-      Serial.printf("[CAN] Send 0x101 failed: %d\n", result);
-    }
-
-    Serial.printf("[CAN] Sent — flags: 0x%02X 0x%02X  bottles: %d  faults: %d  uptime: %d\n",
-      flags[0], flags[1], s.bottleCounter, s.faultCount, s.uptime);
+    // Frame 0x101 — counters (big-endian)
+    twai_message_t msg1 = {};
+    msg1.identifier       = CAN_ID_COUNTERS;
+    msg1.data_length_code = 8;
+    msg1.data[0] = (s.bottleCounter >> 8) & 0xFF;
+    msg1.data[1] =  s.bottleCounter       & 0xFF;
+    msg1.data[2] = (s.faultCount    >> 8) & 0xFF;
+    msg1.data[3] =  s.faultCount          & 0xFF;
+    msg1.data[4] = (s.uptime >> 24) & 0xFF;
+    msg1.data[5] = (s.uptime >> 16) & 0xFF;
+    msg1.data[6] = (s.uptime >>  8) & 0xFF;
+    msg1.data[7] =  s.uptime        & 0xFF;
+    esp_err_t r1 = twai_transmit(&msg1, pdMS_TO_TICKS(10));
+    if (r1 != ESP_OK) Serial.printf("[CAN] TX 0x101 err: %d\n", r1);
   }
 }
 
@@ -381,7 +360,6 @@ void taskCAN(void* pv) {
 // TASK: taskSerial  (core 0, 1 s)
 // ═════════════════════════════════════════════════════════════════════════════
 void taskSerial(void* pv) {
-  Serial.println("[taskSerial] started");
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(1000));
 
@@ -389,20 +367,11 @@ void taskSerial(void* pv) {
     SystemState s = g_state;
     xSemaphoreGive(g_mutex);
 
-    Serial.println("─────────────────────────────────────");
-    Serial.printf("  systemRunning   : %s\n", s.systemRunning    ? "YES" : "NO");
-    Serial.printf("  fault           : %s\n", s.fault            ? "YES" : "NO");
-    Serial.printf("  emergencyStop   : %s\n", s.emergencyStop    ? "YES" : "NO");
-    Serial.printf("  bottlePresent   : %s\n", s.bottlePresent    ? "YES" : "NO");
-    Serial.printf("  bottlePositioned: %s\n", s.bottlePositioned ? "YES" : "NO");
-    Serial.printf("  fillEnable      : %s\n", s.fillEnable       ? "YES" : "NO");
-    Serial.printf("  fillingComplete : %s\n", s.fillingComplete  ? "YES" : "NO");
-    Serial.printf("  valveOn         : %s\n", s.valveOn          ? "YES" : "NO");
-    Serial.printf("  conveyorMotor   : %s\n", s.conveyorMotor    ? "YES" : "NO");
-    Serial.printf("  bottleCounter   : %d\n", s.bottleCounter);
-    Serial.printf("  faultCount      : %d\n", s.faultCount);
-    Serial.printf("  uptime          : %d s\n", s.uptime);
-    Serial.println("─────────────────────────────────────");
+    Serial.println("---");
+    Serial.printf("running:%d fault:%d emergency:%d\n",  s.systemRunning, s.fault, s.emergencyStop);
+    Serial.printf("present:%d positioned:%d valve:%d\n", s.bottlePresent, s.bottlePositioned, s.valveOn);
+    Serial.printf("fill:%d complete:%d motor:%d\n",      s.fillEnable, s.fillingComplete, s.conveyorMotor);
+    Serial.printf("bottles:%d faults:%d uptime:%ds\n",   s.bottleCounter, s.faultCount, s.uptime);
   }
 }
 
@@ -414,38 +383,39 @@ void setup() {
   delay(500);
   Serial.println("\n=== CONTROLLER ESP32 BOOT ===");
 
-  // GPIO
-  pinMode(PIN_SENSOR_PRESENCE, INPUT);
-  pinMode(PIN_SENSOR_LEVEL,    INPUT);
-  pinMode(PIN_SW_START,        INPUT_PULLDOWN);
-  pinMode(PIN_SW_STOP,         INPUT_PULLDOWN);
-  pinMode(PIN_SW_EMERGENCY,    INPUT_PULLDOWN);
-  pinMode(PIN_RELAY_VALVE,     OUTPUT);
-  pinMode(PIN_LED_GREEN,       OUTPUT);
-  pinMode(PIN_LED_YELLOW,      OUTPUT);
-  pinMode(PIN_LED_RED,         OUTPUT);
-  pinMode(PIN_BUZZER,          OUTPUT);
+  pinMode(PIN_SENSOR1,    INPUT);
+  pinMode(PIN_SENSOR2,    INPUT);
+  pinMode(PIN_SW_START,   INPUT_PULLDOWN);
+  pinMode(PIN_SW_STOP,    INPUT_PULLDOWN);
+  pinMode(PIN_SW_EMERG,   INPUT_PULLDOWN);
+  pinMode(PIN_VALVE,      OUTPUT);
+  pinMode(PIN_LED_GREEN,  OUTPUT);
+  pinMode(PIN_LED_YELLOW, OUTPUT);
+  pinMode(PIN_LED_RED,    OUTPUT);
+  pinMode(PIN_BUZZER,     OUTPUT);
 
-  digitalWrite(PIN_RELAY_VALVE,  LOW);
-  digitalWrite(PIN_LED_GREEN,    LOW);
-  digitalWrite(PIN_LED_YELLOW,   LOW);
-  digitalWrite(PIN_LED_RED,      HIGH);  // red on at boot
-  digitalWrite(PIN_BUZZER,       LOW);
+  digitalWrite(PIN_VALVE,      LOW);
+  digitalWrite(PIN_LED_GREEN,  LOW);
+  digitalWrite(PIN_LED_YELLOW, LOW);
+  digitalWrite(PIN_LED_RED,    HIGH);
+  digitalWrite(PIN_BUZZER,     LOW);
 
-  // MCP2515 init — retry until ready
-  Serial.print("[CAN] Initialising MCP2515...");
-  while (CAN_BUS.begin(MCP_ANY, CAN_SPEED, CAN_CLOCK) != CAN_OK) {
-    Serial.print(".");
-    delay(500);
+  // TWAI (CAN) init
+  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+    (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_NORMAL);
+  twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_500KBITS();
+  twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+  if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK ||
+      twai_start() != ESP_OK) {
+    Serial.println("[CAN] Init FAILED — halting.");
+    while (true) delay(1000);
   }
-  CAN_BUS.setMode(MCP_NORMAL);
-  Serial.println(" OK");
+  Serial.println("[CAN] TWAI ready at 500 kbps");
 
-  // Mutex
   g_mutex = xSemaphoreCreateMutex();
   configASSERT(g_mutex);
 
-  // Tasks
   xTaskCreatePinnedToCore(taskInputs,       "Inputs",       2048, NULL, 3, NULL, 1);
   xTaskCreatePinnedToCore(taskStateMachine, "StateMachine", 4096, NULL, 3, NULL, 1);
   xTaskCreatePinnedToCore(taskOutputs,      "Outputs",      2048, NULL, 3, NULL, 1);
@@ -453,7 +423,7 @@ void setup() {
   xTaskCreatePinnedToCore(taskCAN,          "CAN",          4096, NULL, 2, NULL, 0);
   xTaskCreatePinnedToCore(taskSerial,       "Serial",       4096, NULL, 1, NULL, 0);
 
-  Serial.println("=== All tasks created. Press START to begin. ===\n");
+  Serial.println("=== All tasks started. Press START to begin. ===\n");
 }
 
 void loop() {
